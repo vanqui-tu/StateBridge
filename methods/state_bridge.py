@@ -509,6 +509,292 @@ class StateBridge:
         
         return texts, gen_hidden_seq, gen_token_ids, gen_info
 
+    def _generate_with_prefix_batch(
+        self,
+        prompt_embeds: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        prefix_embeds: List[Optional[torch.Tensor]],
+        insert_positions: List[Optional[int]],
+        need_hidden_states: bool = True,
+    ) -> Tuple[List[str], List[torch.Tensor], List[torch.Tensor], List[Dict]]:
+        """Generate a batch while allowing a different prefix per sample.
+
+        Prefixes are padded only for the batched forward pass. Hidden states and
+        token ids are returned per sample so the alignment pipeline remains
+        exactly the same as in ``run_item``.
+        """
+        batch_size = prompt_embeds.shape[0]
+        if batch_size != len(prefix_embeds) or batch_size != len(insert_positions):
+            raise ValueError("Batch metadata must match prompt batch size")
+
+        prompt_rows = [
+            prompt_embeds[i, prompt_mask[i].bool()]
+            for i in range(batch_size)
+        ]
+        full_rows = []
+        for prompt_row, prefix, insert_position in zip(
+            prompt_rows, prefix_embeds, insert_positions
+        ):
+            if prefix is None or prefix.numel() == 0:
+                full_rows.append(prompt_row)
+                continue
+            prefix_row = prefix[0]
+            if insert_position is not None and insert_position > 0:
+                full_rows.append(torch.cat([
+                    prompt_row[:insert_position],
+                    prefix_row,
+                    prompt_row[insert_position:],
+                ], dim=0))
+            else:
+                full_rows.append(torch.cat([prefix_row, prompt_row], dim=0))
+
+        input_lengths = [row.shape[0] for row in full_rows]
+        max_input_len = max(input_lengths, default=0)
+        full_embeds = prompt_embeds.new_zeros(
+            (batch_size, max_input_len, self.hidden_size)
+        )
+        full_mask = prompt_mask.new_zeros((batch_size, max_input_len))
+        for i, row in enumerate(full_rows):
+            # ModelWrapper configures left padding for decoder-only generation.
+            # Keep every row right-aligned so the last valid position is used
+            # as the generation context even when lengths differ.
+            pad_len = max_input_len - row.shape[0]
+            full_embeds[i, pad_len:] = row
+            full_mask[i, pad_len:] = 1
+
+        capture = None
+        hook_handle = None
+        use_hook_mode = self.use_hook and need_hidden_states
+        if use_hook_mode:
+            capture = HiddenStateCapture(device=self.device)
+            model_inner = self.model.model
+            if hasattr(model_inner, 'model') and hasattr(model_inner.model, 'layers'):
+                last_layer = model_inner.model.layers[-1]
+            elif hasattr(model_inner, 'layers'):
+                last_layer = model_inner.layers[-1]
+            elif hasattr(model_inner, 'transformer') and hasattr(model_inner.transformer, 'h'):
+                last_layer = model_inner.transformer.h[-1]
+            else:
+                raise ValueError(f"Cannot find layers in model architecture: {type(model_inner)}")
+            hook_handle = last_layer.register_forward_hook(capture.hook)
+
+        try:
+            with torch.no_grad():
+                gen_outputs = self.model.model.generate(
+                    inputs_embeds=full_embeds,
+                    attention_mask=full_mask,
+                    max_new_tokens=max_input_len + self.max_new_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    do_sample=True,
+                    pad_token_id=self.model.tokenizer.pad_token_id,
+                    return_dict_in_generate=True,
+                    output_hidden_states=need_hidden_states and not self.use_hook,
+                )
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+
+        seqs = gen_outputs.sequences
+        total_len = seqs.shape[1]
+        if total_len < max_input_len:
+            token_rows = [seqs[i] for i in range(batch_size)]
+            generated_len = total_len
+        else:
+            generated_len = total_len - max_input_len
+            token_rows = [seqs[i, max_input_len:] for i in range(batch_size)]
+
+        if need_hidden_states and generated_len > 0:
+            if use_hook_mode:
+                captured = capture.get_all() if capture is not None else None
+            elif hasattr(gen_outputs, 'hidden_states') and gen_outputs.hidden_states:
+                captured_steps = [step[-1][:, -1:, :] for step in gen_outputs.hidden_states]
+                captured = torch.cat(captured_steps, dim=1) if captured_steps else None
+            else:
+                captured = None
+        else:
+            captured = None
+
+        generation_hidden = None
+        if captured is not None and generated_len > 0:
+            generation_hidden = captured[:, -generated_len:, :]
+
+        texts = []
+        hidden_rows = []
+        token_id_rows = []
+        infos = []
+        eos_token_id = self.model.tokenizer.eos_token_id
+        pad_token_id = self.model.tokenizer.pad_token_id
+        for i, row in enumerate(token_rows):
+            row = row.to(self.device)
+            row_len = row.shape[0]
+            if eos_token_id is not None:
+                eos_positions = (row == eos_token_id).nonzero(as_tuple=False)
+                if eos_positions.numel() > 0:
+                    row_len = int(eos_positions[0, 0].item()) + 1
+            elif pad_token_id is not None:
+                pad_positions = (row == pad_token_id).nonzero(as_tuple=False)
+                if pad_positions.numel() > 0:
+                    row_len = int(pad_positions[0, 0].item())
+            row = row[:row_len]
+
+            text = self.model.tokenizer.decode(row, skip_special_tokens=True).strip()
+            texts.append(strip_thinking(text))
+            token_id_rows.append(row.unsqueeze(0))
+
+            if captured is None:
+                hidden = torch.zeros(
+                    (1, row_len, self.hidden_size), dtype=self.dtype, device=self.device
+                )
+            elif row_len == 0:
+                hidden = captured[i, :0].unsqueeze(0)
+            else:
+                hidden = generation_hidden[i, :row_len]
+                if hidden.shape[0] < row_len:
+                    row = row[:hidden.shape[0]]
+                    token_id_rows[-1] = row.unsqueeze(0)
+                    row_len = row.shape[0]
+                hidden = hidden.unsqueeze(0)
+            hidden_rows.append(hidden)
+            infos.append({
+                "actual_gen": row_len,
+                "max_tokens": self.max_new_tokens,
+                "hit_eos": bool(row_len > 0 and eos_token_id is not None and row[-1].item() == eos_token_id),
+            })
+
+        return texts, hidden_rows, token_id_rows, infos
+
+    @torch.no_grad()
+    def run_batch(self, items: List[Dict]) -> List[Dict]:
+        """Run independent items in a batched, agent-by-agent pipeline."""
+        if not items:
+            return []
+        if len(items) == 1:
+            return [self.run_item(items[0])]
+
+        batch_size = len(items)
+        current_prefix: List[Optional[torch.Tensor]] = [None] * batch_size
+        final_texts = [""] * batch_size
+        agent_traces: List[List[Dict]] = [[] for _ in items]
+
+        for agent in self.agents:
+            has_prefix = [prefix is not None and prefix.numel() > 0 for prefix in current_prefix]
+            received_prefix_tokens = [
+                current_prefix[i].shape[1] if has_prefix[i] else 0
+                for i in range(batch_size)
+            ]
+            messages = [build_agent_message_embedding_mas(
+                role=agent.role,
+                question=item["question"],
+                context="",
+                method="embedding_mas",
+                args=self.args,
+                has_prefix=has_prefix[i],
+            ) for i, item in enumerate(items)]
+            prompts, _, _, _ = self.model.prepare_chat_batch(
+                messages, add_generation_prompt=True
+            )
+
+            wrapped_prompts = [f"{prompt}<think>" if self.enable_thinking else prompt for prompt in prompts]
+            insert_positions: List[Optional[int]] = [None] * batch_size
+            for i, prompt_text in enumerate(wrapped_prompts):
+                if not has_prefix[i]:
+                    continue
+                marker_idx = prompt_text.find(EMBEDDING_HINT_MARKER)
+                if marker_idx != -1:
+                    left_text = prompt_text[:marker_idx]
+                    insert_positions[i] = len(self.model.tokenizer(
+                        left_text, add_special_tokens=False
+                    )["input_ids"])
+                    wrapped_prompts[i] = prompt_text.replace(
+                        EMBEDDING_HINT_MARKER + "\n\n", ""
+                    ).replace(EMBEDDING_HINT_MARKER, "")
+
+            encoded = self.model.tokenizer(
+                wrapped_prompts,
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False,
+            )
+            input_ids = encoded["input_ids"].to(self.device)
+            attention_mask = encoded["attention_mask"].to(self.device)
+            prompt_embeds = self.embedding_layer(input_ids)
+            need_hidden = agent.role != "judger"
+
+            gen_start = time.time()
+            generated_texts, hidden_rows, token_rows, gen_infos = self._generate_with_prefix_batch(
+                prompt_embeds,
+                attention_mask,
+                current_prefix,
+                insert_positions,
+                need_hidden,
+            )
+            batch_gen_time = time.time() - gen_start
+            per_item_gen_time = batch_gen_time / batch_size
+
+            think_end_token_ids = self.model.tokenizer.encode(
+                "</think>", add_special_tokens=False
+            )
+            for i in range(batch_size):
+                align_start = time.time()
+                if agent.role != "judger":
+                    gen_token_ids = token_rows[i]
+                    gen_hidden_seq = hidden_rows[i]
+                    think_end_pos = -1
+                    token_list = gen_token_ids[0].tolist()
+                    search_len = len(think_end_token_ids)
+                    if search_len > 0:
+                        for pos in range(len(token_list) - search_len + 1):
+                            if token_list[pos:pos + search_len] == think_end_token_ids:
+                                think_end_pos = pos + search_len
+                                break
+
+                    if think_end_pos > 0 and think_end_pos < gen_hidden_seq.shape[1]:
+                        filtered_hidden = gen_hidden_seq[:, think_end_pos:, :]
+                        filtered_token_ids = gen_token_ids[:, think_end_pos:]
+                    else:
+                        filtered_hidden = gen_hidden_seq
+                        filtered_token_ids = gen_token_ids
+                    if filtered_hidden.shape[1] > self.max_prefix_tokens:
+                        filtered_hidden = filtered_hidden[:, -self.max_prefix_tokens:, :]
+                        filtered_token_ids = filtered_token_ids[:, -self.max_prefix_tokens:]
+
+                    if filtered_hidden.shape[1] > 0:
+                        aligned_embeds = self._align_hidden_sequence(
+                            filtered_hidden, filtered_token_ids
+                        )
+                        if self.collect_viz:
+                            self.viz_data[agent.role].append({
+                                "e_t": self.embedding_layer(filtered_token_ids).float().reshape(-1, self.hidden_size).detach().cpu(),
+                                "h_t": filtered_hidden.float().reshape(-1, self.hidden_size).detach().cpu(),
+                                "e_t1": aligned_embeds.float().reshape(-1, self.hidden_size).detach().cpu(),
+                            })
+                        current_prefix[i] = self._process_prefix(aligned_embeds)
+                align_time = time.time() - align_start
+
+                if agent.role == "judger":
+                    final_texts[i] = generated_texts[i]
+                agent_traces[i].append({
+                    "role": agent.role,
+                    "output": generated_texts[i],
+                    "gen_info": gen_infos[i],
+                    "prompt_tokens": int(attention_mask[i].sum()),
+                    "prefix_tokens": received_prefix_tokens[i],
+                    "generated_tokens": gen_infos[i].get("actual_gen", 0),
+                    "inference_time": round(per_item_gen_time, 4),
+                    "alignment_time": round(align_time, 4),
+                })
+
+            if self.debug_mode and agent.role == "judger":
+                for text in generated_texts:
+                    print(f"\n{'='*30} Judger Output {'='*30}\n{text}\n{'='*70}\n")
+            torch.cuda.synchronize()
+
+        results = []
+        for item, final_text, traces in zip(items, final_texts, agent_traces):
+            results.append(self._build_result(item, final_text, traces))
+        return results
+
     @torch.no_grad()
     def run_item(self, item: Dict) -> Dict:
         """Run the full 4-agent pipeline on a single item."""
@@ -701,6 +987,71 @@ class StateBridge:
             },
         }
 
+    def _build_result(self, item: Dict, final_text: str, agent_traces: List[Dict]) -> Dict:
+        """Build the per-item result shared by single-item and batched runs."""
+        pred = self._extract_answer(final_text, item)
+        pred_1 = self._extract_answer_1(final_text, item)
+        gold = self._get_gold_answer(item)
+
+        if self.task in ['mbppplus', 'humanevalplus']:
+            if pred is None:
+                correct = False
+            else:
+                correct, _ = run_with_timeout(pred + "\n" + gold, timeout=10)
+            correct_1 = correct
+        elif self.task in ["aime2024", "aime2025"]:
+            try:
+                pred_int = int(pred) if pred else None
+                gold_int = int(gold) if gold else None
+                correct = pred_int == gold_int if pred_int is not None and gold_int is not None else False
+            except (TypeError, ValueError):
+                correct = False
+            try:
+                pred_1_int = int(pred_1) if pred_1 else None
+                correct_1 = pred_1_int == gold_int if pred_1_int is not None and gold_int is not None else False
+            except (TypeError, ValueError):
+                correct_1 = False
+        else:
+            correct = (pred == gold) if (pred and gold) else False
+            correct_1 = (pred_1 == gold) if (pred_1 and gold) else False
+
+        total_prompt = sum(t.get("prompt_tokens", 0) for t in agent_traces)
+        total_gen = sum(t.get("generated_tokens", 0) for t in agent_traces)
+        total_prefix = sum(t.get("prefix_tokens", 0) for t in agent_traces)
+        total_inference_time = sum(t.get("inference_time", 0) for t in agent_traces)
+        total_alignment_time = sum(t.get("alignment_time", 0) for t in agent_traces)
+        return {
+            "question": item["question"],
+            "gold": gold,
+            "solution": item.get("solution", ""),
+            "prediction": pred,
+            "prediction_1": pred_1,
+            "correct": correct,
+            "correct_1": correct_1,
+            "final_response": final_text,
+            "idx": item.get("idx", -1),
+            "trace": agent_traces,
+            "efficiency": {
+                "prompt_tokens": total_prompt,
+                "generated_tokens": total_gen,
+                "prefix_tokens": total_prefix,
+                "total_tokens": total_prompt + total_gen + total_prefix,
+                "inference_time": round(total_inference_time, 4),
+                "alignment_time": round(total_alignment_time, 4),
+                "per_agent": [
+                    {
+                        "role": t["role"],
+                        "prompt_tokens": t.get("prompt_tokens", 0),
+                        "generated_tokens": t.get("generated_tokens", 0),
+                        "prefix_tokens": t.get("prefix_tokens", 0),
+                        "inference_time": t.get("inference_time", 0),
+                        "alignment_time": t.get("alignment_time", 0),
+                    }
+                    for t in agent_traces
+                ],
+            },
+        }
+
     def _extract_answer(self, text: str, item: Dict) -> Optional[str]:
         """Extract answer using task-appropriate logic."""
         if self.task in ['mbppplus', 'humanevalplus']:
@@ -747,7 +1098,7 @@ def gpu_worker(
         model_name=config["model_name"],
         task=config["task"],
         prompt=config["prompt"],
-        batch_size=1,
+        batch_size=config.get("batch_size", 1),
     )
     
     model = ModelWrapper(config["model_name"], device=device)
@@ -768,18 +1119,21 @@ def gpu_worker(
     )
     
     while True:
+        task = None
         try:
             task = task_queue.get(timeout=1)
             if task is None:
                 break
             
-            idx, item = task
+            batch = task
             start_t = time.time()
-            result = evaluator.run_item(item)
-            end_t = time.time()
-            result["duration"] = end_t - start_t
-            result["global_idx"] = idx
-            result_queue.put((idx, result, gpu_id))
+            results = evaluator.run_batch([item for _, item in batch])
+            duration = time.time() - start_t
+            per_item_duration = duration / len(batch) if batch else 0.0
+            for (idx, _), result in zip(batch, results):
+                result["duration"] = per_item_duration
+                result["global_idx"] = idx
+                result_queue.put((idx, result, gpu_id))
             
             torch.cuda.empty_cache()
             
@@ -788,7 +1142,8 @@ def gpu_worker(
         except Exception as e:
             import traceback
             error_msg = traceback.format_exc()
-            result_queue.put((idx, {"error": str(e), "traceback": error_msg, "global_idx": idx, "idx": idx}, gpu_id))
+            for idx, item in (task if isinstance(task, list) else []):
+                result_queue.put((idx, {"error": str(e), "traceback": error_msg, "global_idx": idx, "idx": idx}, gpu_id))
             torch.cuda.empty_cache()
     
     if config.get("collect_viz", False):
@@ -830,6 +1185,7 @@ class ParallelEvaluator:
         self.logger.log(f"Already completed (from log): {len(completed)}")
         self.logger.log(f"Pending: {len(pending_indices)}")
         self.logger.log(f"GPUs: {self.gpu_ids}")
+        self.logger.log(f"Batch size per GPU: {max(1, int(self.config.get('batch_size', 1)))}")
         self.logger.log(f"Prefix Strategy: scale (scale=1.0)")
         self.logger.log("=" * 60)
         
@@ -849,10 +1205,14 @@ class ParallelEvaluator:
             p.start()
             workers.append(p)
         
-        for i in pending_indices:
-            item = data[i].copy()
-            item["idx"] = i
-            task_queue.put((i, item))
+        batch_size = max(1, int(self.config.get("batch_size", 1)))
+        for start in range(0, len(pending_indices), batch_size):
+            batch = []
+            for i in pending_indices[start:start + batch_size]:
+                item = data[i].copy()
+                item["idx"] = i
+                batch.append((i, item))
+            task_queue.put(batch)
         
         for _ in workers:
             task_queue.put(None)
@@ -1091,6 +1451,7 @@ def run_single_task(cli_args, task_name: str, gpu_ids: List[int], timestamp: str
         "prompt": cli_args.prompt,
         "max_new_tokens": task_max_tokens,
         "temperature": cli_args.temperature,
+        "batch_size": getattr(cli_args, "batch_size", 1),
         "max_prefix_tokens": cli_args.max_prefix_tokens,
         "prefix_strategy": "scale",
         "enable_thinking": True,
@@ -1127,6 +1488,7 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Limit number of samples per dataset")
     parser.add_argument("--output", type=str, default=None, help="Output file path (single task mode)")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
+    parser.add_argument("--batch_size", type=int, default=1, help="Number of samples per GPU batch")
     parser.add_argument("--max_prefix_tokens", type=int, default=64, help="Max prefix tokens")
     parser.add_argument("--adaptive_reg", type=float, default=1e-3, help="Regularization for covariance whitening")
     parser.add_argument("--snap_ratio", type=float, default=0.3, help="Snap-to-nearest-embedding ratio")
@@ -1235,6 +1597,7 @@ def main():
             "prompt": cli_args.prompt,
             "max_new_tokens": task_max_tokens,
             "temperature": cli_args.temperature,
+            "batch_size": getattr(cli_args, "batch_size", 1),
             "max_prefix_tokens": cli_args.max_prefix_tokens,
             "prefix_strategy": "scale",
             "enable_thinking": True,
